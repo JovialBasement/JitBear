@@ -1,0 +1,144 @@
+//go:build windows
+package main
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/subtle"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/gliderlabs/ssh"
+	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/bcrypt"
+)
+
+const embeddedHostKey = ``
+
+func main() {
+	log.SetOutput(io.Discard)
+
+	forwardHandler := &ssh.ForwardedTCPHandler{}
+
+	server := &ssh.Server{
+		Addr: PORT,
+
+		PasswordHandler: func(ctx ssh.Context, password string) bool {
+			userMatch := subtle.ConstantTimeCompare([]byte(ctx.User()), []byte(USERNAME)) == 1
+			passMatch := bcrypt.CompareHashAndPassword([]byte(PASSWORD_HASH), []byte(password)) == nil
+			return userMatch && passMatch
+		},
+
+		Handler: handleSimpleShell,
+		HostSigners: []ssh.Signer{getHostKey()},
+		
+		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
+			return true
+		}),
+		
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+			return true
+		}),
+		
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": ssh.DirectTCPIPHandler,
+		},
+		
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func handleSimpleShell(s ssh.Session) {
+	io.WriteString(s, "Welcome!\r\n$ ")
+	
+	var line string
+	buf := make([]byte, 1)
+	
+	for {
+		n, err := s.Read(buf)
+		if err != nil {
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		
+		char := buf[0]
+		
+		if char == '\r' || char == '\n' {
+			io.WriteString(s, "\r\n")
+			line = strings.TrimSpace(line)
+			
+			if line == "exit" || line == "quit" {
+				io.WriteString(s, "Goodbye!\r\n")
+				return
+			}
+			
+			if line != "" {
+				executeCommand(s, line)
+			}
+			
+			line = ""
+			io.WriteString(s, "$ ")
+			continue
+		}
+		
+		if char == 127 || char == 8 {
+			if len(line) > 0 {
+				line = line[:len(line)-1]
+				io.WriteString(s, "\b \b")
+			}
+			continue
+		}
+		
+		if char == 3 {
+			io.WriteString(s, "^C\r\n$ ")
+			line = ""
+			continue
+		}
+		
+		s.Write(buf[:1])
+		line += string(char)
+	}
+}
+
+func executeCommand(s ssh.Session, cmdLine string) {
+	cmd := exec.Command("cmd", "/C", cmdLine)
+	
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"SYSTEMROOT=" + os.Getenv("SYSTEMROOT"),
+	}
+	
+	cmd.Stdout = s
+	cmd.Stderr = s
+	cmd.Stdin = s
+	
+	err := cmd.Run()
+	if err != nil {
+		io.WriteString(s, "Error: "+err.Error()+"\r\n")
+	}
+}
+
+func getHostKey() ssh.Signer {
+	if embeddedHostKey != "" {
+		signer, err := gossh.ParsePrivateKey([]byte(embeddedHostKey))
+		if err == nil {
+			return signer
+		}
+	}
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	signer, _ := gossh.NewSignerFromKey(key)
+	return signer
+}

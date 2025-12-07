@@ -1,0 +1,23 @@
+dist/
+*.exe
+
+# Dependencies
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials
+hostkey
+hostkey.pub
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Temporary
+tmp/
+temp/
+```

